@@ -1,0 +1,19 @@
+[package]
+name = "dvc-socks-server"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "dvc_server"
+path = "src/main.rs"
+
+[lib]
+name = "dvc_server_dll"
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+panic = "abort"
+codegen-units = 1

@@ -353,6 +353,9 @@ netexec rdp TARGET_HOST -u LOGIN_USERNAME -p LOGIN_PASSWORD KERBEROS --nla-scree
 netexec rdp TARGET_HOST -u LOGIN_USERNAME -p LOGIN_PASSWORD KERBEROS --screenshot
 netexec rdp TARGET_HOST -u LOGIN_USERNAME -p LOGIN_PASSWORD KERBEROS -X ipconfig
 netexec rdp TARGET_HOST -u LOGIN_USERNAME -p LOGIN_PASSWORD KERBEROS -x ipconfig
+netexec rdp TARGET_HOST -u LOGIN_USERNAME -p LOGIN_PASSWORD --local-auth --rdp-dvc-socks5 127.0.0.1:1080 --dvc-method powershell
+netexec rdp TARGET_HOST -u LOGIN_USERNAME -p LOGIN_PASSWORD --local-auth --rdp-dvc-socks5 127.0.0.1:1080 --dvc-method exe
+netexec rdp TARGET_HOST -u LOGIN_USERNAME -p LOGIN_PASSWORD --local-auth --rdp-dvc-socks5 127.0.0.1:1080 --dvc-method dll
 ##### SSH - Default test passwords and random key; switch these out if you want correct authentication
 netexec ssh TARGET_HOST -u LOGIN_USERNAME -p LOGIN_PASSWORD
 netexec ssh TARGET_HOST -u TEST_USER_FILE -p TEST_PASSWORD_FILE --no-bruteforce

